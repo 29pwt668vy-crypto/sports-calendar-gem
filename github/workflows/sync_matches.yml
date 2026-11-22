@@ -1,0 +1,47 @@
+name: Sync Sports Matches Calendar
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-calendar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch matches and generate ICS
+        env:
+          API_SPORTS_KEY: ${{ secrets.API_SPORTS_KEY }}
+          OUTPUT_ICS_PATH: matches.ics
+          REMINDER_DAYS: "3,1"
+          # Optional: filter specific teams, e.g. "Fenerbahce,Benfica,Kassel"
+          TEAM_FILTER: ""
+        run: python fetch_matches.py
+
+      - name: Commit updated calendar
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add matches.ics
+          if git diff --staged --quiet; then
+            echo "No calendar changes to commit."
+          else
+            git commit -m "chore: update matches.ics [skip ci]"
+            git push
+          fi

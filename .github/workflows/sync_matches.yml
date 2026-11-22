@@ -27,7 +27,7 @@ jobs:
 
       - name: Fetch matches and generate ICS
         env:
-          API_SPORTS_KEY: ${{ secrets.API_SPORTS_KEY }}
+          HIGHLIGHTLY_API_KEY: ${{ secrets.HIGHLIGHTLY_API_KEY }}
           OUTPUT_ICS_PATH: matches.ics
           REMINDER_DAYS: "3,1"
           # Optional: filter specific teams, e.g. "Fenerbahce,Benfica,Kassel"

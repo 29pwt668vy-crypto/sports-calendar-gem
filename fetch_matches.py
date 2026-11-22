@@ -3,33 +3,35 @@
 Sports Schedule -> iPhone Calendar (.ics) Sync Script
 =====================================================
 Fetches upcoming matches for:
-  1. DEL2 (Germany Ice Hockey)
-  2. Turkey BSL / Basketbol Süper Ligi (Basketball)
-  3. Portugal Liga Betclic Masculina / LPB (Basketball)
-  4. Portugal Liga Betclic Feminina (Basketball)
+  1. DEL2 (Germany Ice Hockey) -> Official DEL2 ICS / schedule (no API key needed)
+  2. Portugal Liga Betclic Masculina (Basketball) -> Official FPB calendar (no API key needed)
+  3. Portugal Liga Betclic Feminina (Basketball) -> Official FPB calendar (no API key needed)
+  4. Turkey BSL / Basketbol Süper Ligi (Basketball) -> Highlightly Basketball API (free tier, 100 req/day)
 
-Uses API-Sports (https://api-sports.io/) free tier (100 requests/day per API)
-and generates a standard RFC 5545 .ics calendar file with multi-day VALARM
+Generates a standard RFC 5545 .ics calendar file with multi-day VALARM
 notifications for Apple Calendar (iPhone).
 """
 
 from __future__ import annotations
 
-import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Configuration (override via environment variables or GitHub Actions secrets)
 # ---------------------------------------------------------------------------
 
-API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "").strip()
+HIGHLIGHTLY_API_KEY = os.getenv("HIGHLIGHTLY_API_KEY", "").strip()
 OUTPUT_ICS_PATH = Path(os.getenv("OUTPUT_ICS_PATH", "matches.ics"))
 
 # Comma-separated reminder offsets in days before match start (e.g. "3,1" = 3 days & 1 day before)
@@ -46,66 +48,30 @@ TEAM_FILTER = [
     if t.strip()
 ]
 
-# How many days back/ahead to include in the calendar
 DAYS_BACK = int(os.getenv("DAYS_BACK", "2"))
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "90"))
+REQUEST_TIMEOUT = 25
 
-REQUEST_TIMEOUT = 20
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; SportsCalendarSync/1.0; +https://github.com/)"
+    )
+}
 
-
-@dataclass
-class LeagueTarget:
-    key: str
-    label: str
-    sport: str  # "hockey" or "basketball"
-    base_url: str
-    country: str
-    name_keywords: tuple[str, ...]
-    exclude_keywords: tuple[str, ...] = ()
-    default_duration_minutes: int = 135
-
-
-LEAGUE_TARGETS: list[LeagueTarget] = [
-    LeagueTarget(
-        key="del2",
-        label="DEL2 (Хоккей)",
-        sport="hockey",
-        base_url="https://v1.hockey.api-sports.io",
-        country="Germany",
-        name_keywords=("del2", "del 2"),
-        default_duration_minutes=150,
-    ),
-    LeagueTarget(
-        key="turkey_bsl",
-        label="Turkey BSL (Баскетбол)",
-        sport="basketball",
-        base_url="https://v1.basketball.api-sports.io",
-        country="Turkey",
-        name_keywords=("super lig", "süper lig", "bsl", "super ligi"),
-        exclude_keywords=("women", "kadin", "tbl", "tb2l", "cup", "federation"),
-        default_duration_minutes=120,
-    ),
-    LeagueTarget(
-        key="portugal_lpb_men",
-        label="Portugal Liga Betclic (Муж.)",
-        sport="basketball",
-        base_url="https://v1.basketball.api-sports.io",
-        country="Portugal",
-        name_keywords=("lpb", "liga betclic", "liga portuguesa"),
-        exclude_keywords=("women", "feminina", "proliga", "cup", "taca", "taça"),
-        default_duration_minutes=120,
-    ),
-    LeagueTarget(
-        key="portugal_lpb_women",
-        label="Portugal Liga Betclic Feminina (Жен.)",
-        sport="basketball",
-        base_url="https://v1.basketball.api-sports.io",
-        country="Portugal",
-        name_keywords=("feminina", "women"),
-        exclude_keywords=("proliga", "cup", "taca", "taça", "divisao", "divisão"),
-        default_duration_minutes=120,
-    ),
-]
+PT_MONTHS = {
+    "JAN": 1,
+    "FEV": 2,
+    "MAR": 3,
+    "ABR": 4,
+    "MAI": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AGO": 8,
+    "SET": 9,
+    "OUT": 10,
+    "NOV": 11,
+    "DEZ": 12,
+}
 
 
 @dataclass
@@ -116,138 +82,349 @@ class MatchEvent:
     away_team: str
     start_utc: datetime
     duration_minutes: int
-    venue: str
-    status: str
+    venue: str = ""
+    status: str = "Scheduled"
 
 
-def api_get(base_url: str, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Perform a GET request against API-Sports."""
-    if not API_SPORTS_KEY:
-        raise RuntimeError(
-            "API_SPORTS_KEY is not set. Add it as an environment variable or GitHub Secret."
-        )
-    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-    headers = {"x-apisports-key": API_SPORTS_KEY}
-    resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    payload = resp.json()
-    errors = payload.get("errors")
-    if errors:
-        raise RuntimeError(f"API-Sports error on {url}: {errors}")
-    return payload
+def in_window(dt_utc: datetime) -> bool:
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=DAYS_BACK)) <= dt_utc <= (
+        now + timedelta(days=DAYS_AHEAD)
+    )
 
 
-def pick_latest_season(seasons: list[dict[str, Any]]) -> str | int | None:
-    """Pick the active or most recent season from an API-Sports league object."""
-    if not seasons:
+def matches_team_filter(home: str, away: str) -> bool:
+    if not TEAM_FILTER:
+        return True
+    haystack = f"{home} {away}".lower()
+    return any(t in haystack for t in TEAM_FILTER)
+
+
+# ---------------------------------------------------------------------------
+# 1. DEL2 (Germany Ice Hockey) — Official DEL2 ICS / Schedule (No API Key)
+# ---------------------------------------------------------------------------
+
+
+def parse_ics_datetime(raw: str, tzid: str | None = None) -> datetime | None:
+    raw = raw.strip()
+    try:
+        if raw.endswith("Z"):
+            return datetime.strptime(raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        if "T" in raw:
+            dt = datetime.strptime(raw[:15], "%Y%m%dT%H%M%S")
+            tz = ZoneInfo(tzid) if tzid else ZoneInfo("Europe/Berlin")
+            return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+    except Exception:
         return None
-    now = datetime.now(timezone.utc).date()
-    for s in seasons:
-        start_str = s.get("start")
-        end_str = s.get("end")
-        if start_str and end_str:
-            try:
-                start_d = datetime.strptime(start_str[:10], "%Y-%m-%d").date()
-                end_d = datetime.strptime(end_str[:10], "%Y-%m-%d").date()
-                if start_d <= now <= end_d:
-                    return s.get("season")
-            except ValueError:
-                pass
-    # Fallback to the last season entry
-    return seasons[-1].get("season")
-
-
-def resolve_league(target: LeagueTarget) -> tuple[int, str | int] | None:
-    """Resolve league ID and active season from API-Sports /leagues."""
-    payload = api_get(target.base_url, "/leagues", {"country": target.country})
-    candidates = payload.get("response", [])
-    for item in candidates:
-        # API-Hockey & API-Basketball both return league info either flat or nested
-        league_obj = item.get("league", item)
-        name = str(league_obj.get("name", "")).lower()
-        if any(kw in name for kw in target.name_keywords) and not any(
-            ex in name for ex in target.exclude_keywords
-        ):
-            league_id = league_obj.get("id")
-            seasons = item.get("seasons", [])
-            season = pick_latest_season(seasons)
-            if league_id is not None and season is not None:
-                return int(league_id), season
     return None
 
 
-def parse_utc_datetime(raw_dt: str | None) -> datetime | None:
-    if not raw_dt:
-        return None
-    cleaned = raw_dt.strip().replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(cleaned)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except ValueError:
-        return None
+def fetch_del2_official() -> list[MatchEvent]:
+    """Discover and parse the official DEL2 full-season .ics feed from del-2.org/kalender/."""
+    cal_page = "https://www.del-2.org/kalender/"
+    resp = requests.get(cal_page, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
 
+    soup = BeautifulSoup(resp.text, "html.parser")
+    ics_url = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if ".ics" in href.lower():
+            # Prefer the full-league feed ("Alle Spiele" / first general ics link)
+            ics_url = urljoin(cal_page, href.replace("webcal://", "https://"))
+            if "alle" in (a.get_text(" ", strip=True) + href).lower():
+                break
 
-def fetch_league_matches(target: LeagueTarget) -> list[MatchEvent]:
-    """Fetch and normalize matches for a single LeagueTarget."""
-    resolved = resolve_league(target)
-    if not resolved:
-        print(f"[WARN] Could not resolve league for {target.label}", file=sys.stderr)
-        return []
+    if not ics_url:
+        print("[WARN] DEL2: .ics link not found on del-2.org/kalender/, trying spielplan", file=sys.stderr)
+        return fetch_del2_spielplan_fallback()
 
-    league_id, season = resolved
-    print(f"[INFO] {target.label}: league_id={league_id}, season={season}")
+    ics_resp = requests.get(ics_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    ics_resp.raise_for_status()
 
-    payload = api_get(
-        target.base_url,
-        "/games",
-        {"league": league_id, "season": season},
-    )
-    games = payload.get("response", [])
-    now = datetime.now(timezone.utc)
-    window_start = now - timedelta(days=DAYS_BACK)
-    window_end = now + timedelta(days=DAYS_AHEAD)
-
+    # Unfold RFC 5545 folded lines
+    raw_text = ics_resp.text.replace("\r\n ", "").replace("\r\n\t", "")
     events: list[MatchEvent] = []
-    for g in games:
-        start_utc = parse_utc_datetime(g.get("date"))
-        if not start_utc or not (window_start <= start_utc <= window_end):
+    in_event = False
+    cur: dict[str, tuple[str, str | None]] = {}
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if line == "BEGIN:VEVENT":
+            in_event = True
+            cur = {}
             continue
-
-        teams = g.get("teams", {})
-        home = str(teams.get("home", {}).get("name", "Home")).strip()
-        away = str(teams.get("away", {}).get("name", "Away")).strip()
-
-        if TEAM_FILTER:
-            haystack = f"{home} {away}".lower()
-            if not any(t in haystack for t in TEAM_FILTER):
+        if line == "END:VEVENT" and in_event:
+            in_event = False
+            dt_val, tzid = cur.get("DTSTART", ("", None))
+            start_utc = parse_ics_datetime(dt_val, tzid)
+            summary = cur.get("SUMMARY", ("", None))[0]
+            if not start_utc or not in_window(start_utc) or not summary:
                 continue
 
-        status_obj = g.get("status", {})
-        status = str(
-            status_obj.get("long") or status_obj.get("short") or "Scheduled"
-        ).strip()
-        venue = str(g.get("venue") or "").strip()
-        game_id = g.get("id", f"{start_utc.timestamp()}-{home}-{away}")
+            parts = re.split(r"\s+(?:-|–|—|vs\.?|:)\s+", summary, maxsplit=1)
+            if len(parts) == 2:
+                home, away = parts[0].strip(), parts[1].strip()
+            else:
+                home, away = summary.strip(), ""
 
+            if not matches_team_filter(home, away):
+                continue
+
+            uid = cur.get("UID", (f"del2-{int(start_utc.timestamp())}-{home}", None))[0]
+            venue = cur.get("LOCATION", ("", None))[0]
+            events.append(
+                MatchEvent(
+                    uid=f"del2-{uid}",
+                    league_label="DEL2 (Хоккей)",
+                    home_team=home,
+                    away_team=away,
+                    start_utc=start_utc,
+                    duration_minutes=150,
+                    venue=venue,
+                )
+            )
+            continue
+
+        if in_event and ":" in line:
+            key_part, val = line.split(":", 1)
+            key_name = key_part.split(";", 1)[0].upper()
+            tzid = None
+            m_tz = re.search(r"TZID=([^;:]+)", key_part, re.IGNORECASE)
+            if m_tz:
+                tzid = m_tz.group(1)
+            cur[key_name] = (val.strip(), tzid)
+
+    return events
+
+
+def fetch_del2_spielplan_fallback() -> list[MatchEvent]:
+    """Fallback parser for https://www.del-2.org/spielplan/."""
+    url = "https://www.del-2.org/spielplan/"
+    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    text = BeautifulSoup(resp.text, "html.parser").get_text("\n")
+    berlin = ZoneInfo("Europe/Berlin")
+    now_berlin = datetime.now(berlin)
+    events: list[MatchEvent] = []
+
+    # Matches lines like: "ECK - : - EBR" followed by "27.11. 19:30 Uhr"
+    pattern = re.compile(
+        r"([A-Z0-9]{2,5})\s*-\s*:\s*-\s*([A-Z0-9]{2,5})\s+(\d{2})\.(\d{2})\.\s+(\d{2}):(\d{2})\s*Uhr"
+    )
+    for m in pattern.finditer(text):
+        home, away, day, month, hour, minute = m.groups()
+        year = now_berlin.year
+        if int(month) < now_berlin.month - 2:
+            year += 1
+        dt_local = datetime(year, int(month), int(day), int(hour), int(minute), tzinfo=berlin)
+        start_utc = dt_local.astimezone(timezone.utc)
+        if not in_window(start_utc) or not matches_team_filter(home, away):
+            continue
         events.append(
             MatchEvent(
-                uid=f"{target.key}-{game_id}@sports-sync",
-                league_label=target.label,
+                uid=f"del2-{int(start_utc.timestamp())}-{home}-{away}@sports-sync",
+                league_label="DEL2 (Хоккей)",
                 home_team=home,
                 away_team=away,
                 start_utc=start_utc,
-                duration_minutes=target.default_duration_minutes,
-                venue=venue,
-                status=status,
+                duration_minutes=150,
             )
         )
     return events
 
 
+# ---------------------------------------------------------------------------
+# 2. Portugal Liga Betclic (Men & Women) — Official FPB Calendar (No API Key)
+# ---------------------------------------------------------------------------
+
+
+def fetch_fpb_portugal() -> list[MatchEvent]:
+    """Parse upcoming Liga Betclic Masculina & Feminina games from fpb.pt/calendario/."""
+    lisbon = ZoneInfo("Europe/Lisbon")
+    events: list[MatchEvent] = []
+    seen_uids: set[str] = set()
+
+    # Check main calendar page + Liga Betclic Feminina page
+    urls = [
+        "https://www.fpb.pt/calendario/",
+        "https://www.fpb.pt/competicao/10906/",
+    ]
+
+    date_re = re.compile(r"\b(\d{1,2})\s+([A-Z]{3})\s+(\d{4})\b")
+    time_re = re.compile(r"\b(\d{2})H(\d{2})\b", re.IGNORECASE)
+
+    for page_url in urls:
+        try:
+            resp = requests.get(page_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[WARN] FPB fetch failed for {page_url}: {exc}", file=sys.stderr)
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        lines = [ln.strip() for ln in soup.get_text("\n").splitlines() if ln.strip()]
+
+        current_date: tuple[int, int, int] | None = None
+        i = 0
+        while i < len(lines):
+            dm = date_re.fullmatch(lines[i].upper())
+            if dm:
+                d_str, m_str, y_str = dm.groups()
+                if m_str in PT_MONTHS:
+                    current_date = (int(y_str), PT_MONTHS[m_str], int(d_str))
+                i += 1
+                continue
+
+            tm = time_re.fullmatch(lines[i])
+            if tm and current_date and i >= 1:
+                hour, minute = int(tm.group(1)), int(tm.group(2))
+                home = lines[i - 1]
+                # Look ahead within next 6 lines for away team, venue, and competition name
+                window_lines = lines[i + 1 : i + 7]
+                comp_label = None
+                for wl in window_lines:
+                    low = wl.lower()
+                    if "liga betclic feminina" in low:
+                        comp_label = "Portugal Liga Betclic Feminina (Жен.)"
+                        break
+                    if "liga betclic masculina" in low:
+                        comp_label = "Portugal Liga Betclic (Муж.)"
+                        break
+
+                if comp_label and len(window_lines) >= 1:
+                    away = window_lines[0]
+                    venue = window_lines[1] if len(window_lines) >= 2 and "liga betclic" not in window_lines[1].lower() else ""
+                    dt_local = datetime(
+                        current_date[0],
+                        current_date[1],
+                        current_date[2],
+                        hour,
+                        minute,
+                        tzinfo=lisbon,
+                    )
+                    start_utc = dt_local.astimezone(timezone.utc)
+                    uid = f"fpb-{int(start_utc.timestamp())}-{home}-{away}@sports-sync"
+                    if uid not in seen_uids and in_window(start_utc) and matches_team_filter(home, away):
+                        seen_uids.add(uid)
+                        events.append(
+                            MatchEvent(
+                                uid=uid,
+                                league_label=comp_label,
+                                home_team=home,
+                                away_team=away,
+                                start_utc=start_utc,
+                                duration_minutes=120,
+                                venue=venue,
+                            )
+                        )
+            i += 1
+
+    return events
+
+
+# ---------------------------------------------------------------------------
+# 3. Turkey BSL (Basketball) — Highlightly Basketball API (Free Plan: 100/day)
+# ---------------------------------------------------------------------------
+
+
+def fetch_turkey_bsl_highlightly() -> list[MatchEvent]:
+    """Fetch Turkey BSL upcoming matches via Highlightly Basketball API (free tier)."""
+    if not HIGHLIGHTLY_API_KEY:
+        print(
+            "[INFO] HIGHLIGHTLY_API_KEY is not set — skipping Turkey BSL. "
+            "Get a free key (100 req/day, no card) at https://highlightly.net/basketball-api/",
+            file=sys.stderr,
+        )
+        return []
+
+    base_url = "https://basketball.highlightly.net"
+    hl_headers = {"x-rapidapi-key": HIGHLIGHTLY_API_KEY}
+
+    # 1. Discover Turkish Super Ligi ID
+    leagues_resp = requests.get(
+        f"{base_url}/leagues",
+        headers=hl_headers,
+        params={"countryCode": "TR", "limit": 50},
+        timeout=REQUEST_TIMEOUT,
+    )
+    leagues_resp.raise_for_status()
+    leagues_data = leagues_resp.json().get("data", [])
+
+    league_id = None
+    season = None
+    for lg in leagues_data:
+        name = str(lg.get("name", "")).lower()
+        if ("super" in name or "bsl" in name) and "women" not in name and "kadin" not in name:
+            league_id = lg.get("id")
+            seasons = lg.get("seasons", [])
+            if seasons:
+                last_s = seasons[-1]
+                season = last_s.get("season") if isinstance(last_s, dict) else last_s
+            break
+
+    if not league_id:
+        print("[WARN] Turkey BSL: could not find league ID in Highlightly /leagues", file=sys.stderr)
+        return []
+
+    # 2. Fetch matches for the league & season
+    params: dict[str, Any] = {"leagueId": league_id, "limit": 100}
+    if season:
+        params["season"] = season
+
+    matches_resp = requests.get(
+        f"{base_url}/matches",
+        headers=hl_headers,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+    matches_resp.raise_for_status()
+    matches_data = matches_resp.json().get("data", [])
+
+    events: list[MatchEvent] = []
+    for m in matches_data:
+        raw_date = m.get("date") or m.get("startTime")
+        if not raw_date:
+            continue
+        try:
+            start_utc = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+        if not in_window(start_utc):
+            continue
+
+        home = str(m.get("homeTeam", {}).get("name", "Home")).strip()
+        away = str(m.get("awayTeam", {}).get("name", "Away")).strip()
+        if not matches_team_filter(home, away):
+            continue
+
+        state_desc = str(m.get("state", {}).get("description", "Scheduled")).strip()
+        venue = ""
+        if isinstance(m.get("venue"), dict):
+            venue = str(m["venue"].get("name") or "").strip()
+
+        events.append(
+            MatchEvent(
+                uid=f"bsl-{m.get('id', int(start_utc.timestamp()))}@sports-sync",
+                league_label="Turkey BSL (Баскетбол)",
+                home_team=home,
+                away_team=away,
+                start_utc=start_utc,
+                duration_minutes=120,
+                venue=venue,
+                status=state_desc,
+            )
+        )
+    return events
+
+
+# ---------------------------------------------------------------------------
+# ICS Builder (RFC 5545 with VALARM reminders for iPhone)
+# ---------------------------------------------------------------------------
+
+
 def ics_escape(text: str) -> str:
-    """Escape special characters according to RFC 5545."""
     return (
         text.replace("\\", "\\\\")
         .replace(";", "\\;")
@@ -257,9 +434,7 @@ def ics_escape(text: str) -> str:
 
 
 def fold_ics_line(line: str) -> str:
-    """Fold long lines at 75 octets per RFC 5545."""
-    encoded = line.encode("utf-8")
-    if len(encoded) <= 75:
+    if len(line.encode("utf-8")) <= 75:
         return line
     chunks: list[str] = []
     current = ""
@@ -275,7 +450,6 @@ def fold_ics_line(line: str) -> str:
 
 
 def build_ics(events: list[MatchEvent]) -> str:
-    """Build a complete RFC 5545 iCalendar string with VALARM reminders."""
     now_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
@@ -294,8 +468,9 @@ def build_ics(events: list[MatchEvent]) -> str:
         dt_end = (ev.start_utc + timedelta(minutes=ev.duration_minutes)).strftime(
             "%Y%m%dT%H%M%SZ"
         )
-        summary = f"[{ev.league_label}] {ev.home_team} — {ev.away_team}"
-        description = f"Лига: {ev.league_label}\\nМатч: {ev.home_team} vs {ev.away_team}\\nСтатус: {ev.status}"
+        title = f"{ev.home_team} — {ev.away_team}" if ev.away_team else ev.home_team
+        summary = f"[{ev.league_label}] {title}"
+        description = f"Лига: {ev.league_label}\\nМатч: {title}\\nСтатус: {ev.status}"
 
         lines.extend(
             [
@@ -316,7 +491,7 @@ def build_ics(events: list[MatchEvent]) -> str:
                 [
                     "BEGIN:VALARM",
                     "ACTION:DISPLAY",
-                    f"DESCRIPTION:{ics_escape(f'Через {days} дн.: {ev.home_team} — {ev.away_team}')}",
+                    f"DESCRIPTION:{ics_escape(f'Через {days} дн.: {title}')}",
                     f"TRIGGER:-P{days}D",
                     "END:VALARM",
                 ]
@@ -330,13 +505,20 @@ def build_ics(events: list[MatchEvent]) -> str:
 
 def main() -> int:
     all_events: list[MatchEvent] = []
-    for target in LEAGUE_TARGETS:
+
+    sources = [
+        ("DEL2 (Хоккей)", fetch_del2_official),
+        ("Portugal Liga Betclic (Муж. и Жен.)", fetch_fpb_portugal),
+        ("Turkey BSL (Баскетбол)", fetch_turkey_bsl_highlightly),
+    ]
+
+    for label, fn in sources:
         try:
-            matches = fetch_league_matches(target)
-            print(f"[INFO] Fetched {len(matches)} matches for {target.label}")
-            all_events.extend(matches)
+            items = fn()
+            print(f"[INFO] {label}: fetched {len(items)} matches")
+            all_events.extend(items)
         except Exception as exc:
-            print(f"[ERROR] Failed {target.label}: {exc}", file=sys.stderr)
+            print(f"[ERROR] {label}: {exc}", file=sys.stderr)
 
     ics_content = build_ics(all_events)
     OUTPUT_ICS_PATH.parent.mkdir(parents=True, exist_ok=True)
